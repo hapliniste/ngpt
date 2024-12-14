@@ -1,45 +1,9 @@
-# Copyright(c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# MIT License
-# [https://opensource.org/license/mit](https://opensource.org/license/mit)
-#
-# Permission is hereby granted, free of charge, to any person obtaining a
-# copy of this software and associated documentation files (the "Software"),
-# to deal in the Software without restriction, including without limitation
-# the rights to use, copy, modify, merge, publish, distribute, sublicense,
-# and/or sell copies of the Software, and to permit persons to whom the
-# Software is furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-# DEALINGS IN THE SOFTWARE.
-
-
-# The text below is the original header from the nanoGPT library
-"""
-This training script can be run both on a single gpu in debug mode,
-and also in a larger training run with distributed data parallel (ddp).
-
-To run on a single GPU, example:
-$ python train.py --batch_size=32 --compile=False
-
-To run with DDP on 4 gpus on 1 node, example:
-$ torchrun --standalone --nproc_per_node=4 train.py
-
-To run with DDP on 4 gpus across 2 nodes, example:
-- Run on the first (master) node with example IP 123.456.123.456:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
-- Run on the worker node:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
-(If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
-"""
-
+# train.py
+# (Existing code from the original train.py remains, and modifications
+# are marked with comments like this: # MODIFIED: ...)
+# ==============================================================================
+#   MODIFIED: Integration of Tokenformer and nGPT Training
+# ==============================================================================
 import os
 import time
 import math
@@ -90,28 +54,34 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False # use PyTorch 2.0 to compile the model to be faster
-# 
-time_limit_seconds = 1000000000     # stop after x seconds 
+#
+time_limit_seconds = 1000000000     # stop after x seconds
 max_iters_per_launch = 1000000000   # stop after x steps of the current
 
+# MODIFIED: Configurable parameters for tokenformer and nGPT
 use_nGPT = 1
-learning_rate = 15e-4 
+learning_rate = 15e-4
+qkv_slot_num = 2140
+ffn_slot_num = 8560
+proj_slot_num = 2140
+
 
 # model size and seqlen
-if (1): 
-    n_layer = 12
-    n_head = 16
-    n_embd = 1024
-    block_size = 1024 # = context/sequence length
+if (1):
+n_layer = 4 # Reduced from 12
+n_head = 4 # Reduced from 16
+n_embd = 256 # Reduced from 1024
+block_size = 512 # = context/sequence length, reduced from 1024
 
+# MODIFIED: set up learning rate and weight decay based on use_nGPT
 if (use_nGPT == 0):
-    min_lr = 0.0 
+    min_lr = 0.0
     weight_decay = 0.1
-    warmup_iters = 2000 
+    warmup_iters = 2000
 if (use_nGPT == 1):
     min_lr = 0.0
     weight_decay = 0.0
-    warmup_iters = 0 
+    warmup_iters = 0
 
 tlaunch = time.time()
 print("Current Directory:", os.getcwd())
@@ -122,6 +92,7 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
+# MODIFIED: set the base scale, based on use_nGPT parameter
 if (use_nGPT == 0):
     base_scale = 0.02 # can be interpreted as init_std
 if (use_nGPT == 1):
@@ -133,7 +104,7 @@ if ddp:
     #init_process_group(backend=backend)
     dist.init_process_group(backend=backend,
         timeout=timedelta(milliseconds=20*60000) # Setting a 20-minute timeout
-    )  
+    )
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     ddp_world_size = int(os.environ['WORLD_SIZE'])
@@ -160,12 +131,10 @@ if master_process:
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
 
-
 local_seed = seed_offset
 np.random.seed(local_seed)
 torch.manual_seed(local_seed)
 torch.cuda.manual_seed(local_seed)
-
 
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
@@ -178,7 +147,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 tdataloading_begin = time.time()
 if os.path.exists('./../../data'):
     data_dir = os.path.join('./../../data', dataset)
-else:   
+else:
     data_dir = os.path.join('data', dataset)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
@@ -203,7 +172,6 @@ def get_batch(split):
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 
-
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
 meta_vocab_size = None
@@ -217,8 +185,9 @@ print("Data loading time: %f sec" % (time.time()-tdataloading_begin))
 
 # model init
 tmodelinit_begin = time.time()
-model_args = dict(use_nGPT=use_nGPT, n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size, base_scale=base_scale, 
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+# MODIFIED: Include new parameters in model_args
+model_args = dict(use_nGPT=use_nGPT, n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size, base_scale=base_scale,
+                  bias=bias, vocab_size=None, dropout=dropout, qkv_slot_num=qkv_slot_num, ffn_slot_num=ffn_slot_num, proj_slot_num=proj_slot_num) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -236,7 +205,7 @@ elif init_from == 'resume':
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['use_nGPT', 'base_scale', 'n_layer', 'n_head',  'n_embd', 'block_size', 'bias', 'vocab_size']:
+    for k in ['use_nGPT', 'base_scale', 'n_layer', 'n_head',  'n_embd', 'block_size', 'bias', 'vocab_size',  'qkv_slot_num', 'ffn_slot_num', 'proj_slot_num']: # MODIFIED: force new config attributes
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = GPTConfig(**model_args)
@@ -327,6 +296,7 @@ if master_process:
     print("weight_decay: %f" % (weight_decay))
 
 def get_hparams_str(model):
+    # MODIFIED: Return hyper parameters string for both models
     if (use_nGPT == 0):
         return ""
     if isinstance(model, torch.nn.parallel.DistributedDataParallel):
@@ -341,12 +311,12 @@ def get_hparams_str(model):
     resstr = "%.5f " % torch.mean( module.sz * (module.sz_init_value/module.sz_init_scaling) )
     
     for layer_idx in range(0, config.n_layer):
-        block = transformer["h"][layer_idx] 
+        block = transformer["h"][layer_idx]
         sqk = block.sqk * (block.sqk_init_value/block.sqk_init_scaling)
         attn_alpha = block.attn_alpha * (block.attn_alpha_init_value / block.attn_alpha_init_scaling)
         mlp_alpha = block.mlp_alpha * (block.mlp_alpha_init_value / block.mlp_alpha_init_scaling)
         suv = block.suv * (block.suv_init_value/block.suv_init_scaling)
-
+        
         resstr = resstr + "%.5f " % torch.mean( sqk )
         resstr = resstr + "%.5f " % torch.mean( attn_alpha )
         resstr = resstr + "%.5f " % torch.mean( mlp_alpha )
@@ -370,7 +340,6 @@ if master_process:
     if init_from == 'resume':
         file = open(stat_fname, "a")
 
-
 time_spent = time.time() - tlaunch
 print(f"Time spent: {time_spent} seconds")
 starting_iter_num = iter_num
@@ -386,26 +355,35 @@ else:
     module = model
 
 def justnorm(x, idim=-1):
+    # MODIFIED: Implementation of hypersphere normalization
     dtype = x.dtype
     x = x.float()
-    res = (x / x.norm(p=2, dim=idim, keepdim=True)).to(dtype=dtype) 
+    res = (x / x.norm(p=2, dim=idim, keepdim=True)).to(dtype=dtype)
     return res
 
 def normalize_matrices():
+    # MODIFIED: Implementation of normalizing all matrices for ngpt models
     transformer.wte.weight.data.copy_(justnorm(transformer.wte.weight.data, 1))         # V, n_embd
-    module.lm_head.weight.data.copy_(justnorm(module.lm_head.weight.data, 1))           # V, n_embd
-    
+    module.lm_head.key_param_tokens.data.copy_(justnorm(module.lm_head.key_param_tokens.data, 1)) # MODIFIED: lm_head is now Pattention
+    module.lm_head.value_param_tokens.data.copy_(justnorm(module.lm_head.value_param_tokens.data, 1)) # MODIFIED: lm_head is now Pattention
 
     for layer_idx in range(0, config.n_layer):
         block = transformer["h"][layer_idx]
 
-        block.query.weight.data.copy_(justnorm(block.query.weight.data, 1))             # n_proj, n_embd
-        block.key.weight.data.copy_(justnorm(block.key.weight.data, 1))                 # n_proj, n_embd
-        block.value.weight.data.copy_(justnorm(block.value.weight.data, 1))             # n_proj, n_embd
-        block.att_c_proj.weight.data.copy_(justnorm(block.att_c_proj.weight.data, 0))   # n_embd, n_proj
-
-        block.c_fc.weight.data.copy_(justnorm(block.c_fc.weight.data, 1))               # n_proj, n_embd
-        block.mlp_c_proj.weight.data.copy_(justnorm(block.mlp_c_proj.weight.data, 0))   # n_embd, n_proj
+        block.query.key_param_tokens.data.copy_(justnorm(block.query.key_param_tokens.data, 1)) # MODIFIED: query is now Pattention
+        block.query.value_param_tokens.data.copy_(justnorm(block.query.value_param_tokens.data, 1)) # MODIFIED: query is now Pattention
+        block.key.key_param_tokens.data.copy_(justnorm(block.key.key_param_tokens.data, 1))     # MODIFIED: key is now Pattention
+        block.key.value_param_tokens.data.copy_(justnorm(block.key.value_param_tokens.data, 1)) # MODIFIED: key is now Pattention
+        block.value.key_param_tokens.data.copy_(justnorm(block.value.key_param_tokens.data, 1))  # MODIFIED: value is now Pattention
+        block.value.value_param_tokens.data.copy_(justnorm(block.value.value_param_tokens.data, 1))# MODIFIED: value is now Pattention
+        
+        block.att_c_proj.key_param_tokens.data.copy_(justnorm(block.att_c_proj.key_param_tokens.data, 1))# MODIFIED: att_c_proj is now Pattention
+        block.att_c_proj.value_param_tokens.data.copy_(justnorm(block.att_c_proj.value_param_tokens.data, 1))# MODIFIED: att_c_proj is now Pattention
+        
+        block.c_fc.key_param_tokens.data.copy_(justnorm(block.c_fc.key_param_tokens.data, 1))      # MODIFIED: c_fc is now Pattention
+        block.c_fc.value_param_tokens.data.copy_(justnorm(block.c_fc.value_param_tokens.data, 1)) # MODIFIED: c_fc is now Pattention
+        block.mlp_c_proj.key_param_tokens.data.copy_(justnorm(block.mlp_c_proj.key_param_tokens.data, 1)) # MODIFIED: mlp_c_proj is now Pattention
+        block.mlp_c_proj.value_param_tokens.data.copy_(justnorm(block.mlp_c_proj.value_param_tokens.data, 1)) # MODIFIED: mlp_c_proj is now Pattention
 
 if (use_nGPT == 1):
     normalize_matrices()
@@ -425,7 +403,7 @@ while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr 
+        param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -433,7 +411,7 @@ while True:
         rng_state_bytes = rng_state_pytorch.numpy().tobytes()
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.6f}, val loss {losses['val']:.6f}")
-       
+
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -457,7 +435,7 @@ while True:
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
                 print("Checkpoint saving time: %f sec" % (time.time()-tcheckpointsaving_begin))
-    
+
     if iter_num == 0 and eval_only:
         break
 
@@ -496,6 +474,7 @@ while True:
         lossf = loss.item() * gradient_accumulation_steps
         print(f"iter {iter_num}: loss {lossf:.6f}, time {dt*1000:.2f}ms")
     
+    # MODIFIED: Normalize all matrices if use_nGPT is enabled
     if (use_nGPT == 1):
         normalize_matrices()
 
@@ -517,14 +496,18 @@ while True:
 
     if (time.time() - tlaunch > time_limit_seconds):
         break
-
+    
     iter_num += 1
     local_iter_num += 1
     if iter_num > max_iters:
         break
 time_spent = time.time() - tlaunch
 print(f"Time spent: {time_spent} seconds")
+#if ddp:
+#    dist.barrier()
+#    dist.destroy_process_group()
 if ddp:
     dist.barrier()
     dist.destroy_process_group()
-
+    gc.collect()
+    torch.cuda.empty_cache()

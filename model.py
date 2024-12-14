@@ -1,35 +1,9 @@
-# Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# MIT license
-#
-# Permission is hereby granted, free of charge, to any person obtaining a
-# copy of this software and associated documentation files (the "Software"),
-# to deal in the Software without restriction, including without limitation
-# the rights to use, copy, modify, merge, publish, distribute, sublicense,
-# and/or sell copies of the Software, and to permit persons to whom the
-# Software is furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-# DEALINGS IN THE SOFTWARE.
-
-
-# The text below is the original header from the nanoGPT library
-"""
-Full definition of a GPT Language Model, all of it in this single file.
-References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
-"""
-
+# model.py
+# (Existing code from the original model.py remains, and modifications
+# are marked with comments like this: # MODIFIED: ...)
+# ==============================================================================
+#   MODIFIED: Integration of Pattention and nGPT Normalization
+# ==============================================================================
 import math
 import inspect
 from dataclasses import dataclass
@@ -39,7 +13,6 @@ import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
 from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
-
 
 def apply_rotary_position_embeddings(sinusoidal_pos, q, k):
     # Split the sinusoidal_pos into sin and cos parts
@@ -63,25 +36,149 @@ def get_sinusoidal_embeddings( n_positions, dim):
     return sinusoidal_emb
 
 
+class Pattention(nn.Module):
+    """Pattention Layer from Tokenformer, modified for nGPT."""
+
+    def __init__(
+        self,
+        config, # MODIFIED: use config instead of neox_args
+        input_channels,
+        output_channels,
+        param_token_num,
+        param_key_init_method,
+        param_value_init_method,
+    ):
+        super().__init__()
+
+        self.config = config # MODIFIED: store config
+        self.param_token_num = param_token_num
+        self.param_key_dim = input_channels
+        self.param_value_dim = output_channels
+        self.norm_activation_type = 'gelu_l2_norm' # MODIFIED: Hardcode gelu_l2_norm for now, can be set in config later
+        
+        self.key_param_tokens = nn.parameter.Parameter(
+            data=torch.rand((self.param_token_num, self.param_key_dim), dtype=torch.bfloat16))  # MODIFIED: bfloat16
+        self.value_param_tokens = nn.parameter.Parameter(
+            data=torch.rand((self.param_token_num, self.param_value_dim), dtype=torch.bfloat16))  # MODIFIED: bfloat16
+        
+        param_key_init_method(self.key_param_tokens)
+        param_value_init_method(self.value_param_tokens)
+
+
+    def nonlinear_norm_func(self, inputs, normalize_type, dim=-1):
+        if normalize_type == 'softmax': 
+            # NOTE: softmax = exp_l1_norm
+            # outputs = F.softmax(inputs, dim=dim) * inputs.shape[dim]
+            nonlinear_outputs = torch.exp(inputs)
+            norm_outputs = nonlinear_outputs / torch.norm(nonlinear_outputs, p=1, dim=dim, keepdim=True) * inputs.shape[dim]
+            outputs = norm_outputs
+        elif normalize_type == 'gelu_l2_norm':
+            nonlinear_outputs = F.gelu(inputs)
+            norm_outputs = nonlinear_outputs / torch.norm(nonlinear_outputs, p=2, dim=dim, keepdim=True) * math.sqrt(nonlinear_outputs.shape[dim])
+            outputs = norm_outputs
+        elif normalize_type == 'l2_norm_gelu':
+            norm_outputs = inputs / torch.norm(inputs, p=2, dim=dim, keepdim=True) * math.sqrt(inputs.shape[dim])
+            nonlinear_outputs = F.gelu(norm_outputs)
+            outputs = nonlinear_outputs
+        else:
+            raise NotImplementedError
+        return outputs
+
+    def forward(self, inputs, dropout_p=0.0, router_index=None, attn_mask=None, scale=None):
+
+        query = inputs
+        if router_index is None:
+            # not MoE mode
+            key, value = self.key_param_tokens, self.value_param_tokens
+        else:
+            key, value = self.key_param_tokens[router_index], self.value_param_tokens[router_index]
+        
+        L, S = query.size(-2), key.size(-2)
+        scale_factor = 1 if scale is None else scale 
+        # just for gelu nonlinear, set torch.zeros for softmax
+        attn_bias = torch.ones(L, S, dtype=query.dtype, device=query.device)
+
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                # just for gelu nonlinear, set -inf for softmax
+                attn_bias.masked_fill_(attn_mask.logical_not(), 0)
+            else:
+                raise NotImplementedError
+
+        attn_weight = query @ key.transpose(-2, -1) * scale_factor
+        # just for gelu nonlinear, set attn_weight += attn_bias for softmax
+        attn_weight *= attn_bias
+        # modified softmax
+        attn_weight = self.nonlinear_norm_func(attn_weight, self.norm_activation_type, dim=-1)
+        attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+        output = attn_weight @ value
+
+        return output
+
 class Block(nn.Module):
 
     def __init__(self, config, iblock):
         super().__init__()
         self.config = config
+        # MODIFIED: Replace linear layers with Pattention
+        self.key = Pattention(
+            config=config,
+            input_channels=config.n_embd,
+            output_channels=config.n_embd,
+            param_token_num=config.qkv_slot_num, # MODIFIED: use config variable
+            param_key_init_method=nn.init.xavier_normal_,
+            param_value_init_method=nn.init.zeros_
+        )
 
-        self.key = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
-        self.query = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
-        self.value = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
-        self.att_c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
-        
-        self.c_fc    = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=config.bias, dtype=torch.bfloat16)
+        self.query = Pattention(
+            config=config,
+            input_channels=config.n_embd,
+            output_channels=config.n_embd,
+            param_token_num=config.qkv_slot_num, # MODIFIED: use config variable
+            param_key_init_method=nn.init.xavier_normal_,
+            param_value_init_method=nn.init.zeros_
+        )
+        self.value = Pattention(
+            config=config,
+            input_channels=config.n_embd,
+            output_channels=config.n_embd,
+             param_token_num=config.qkv_slot_num, # MODIFIED: use config variable
+            param_key_init_method=nn.init.xavier_normal_,
+            param_value_init_method=nn.init.zeros_
+        )
+
+        self.att_c_proj = Pattention(
+            config=config,
+            input_channels=config.n_embd,
+            output_channels=config.n_embd,
+             param_token_num=config.proj_slot_num,  # MODIFIED: use config variable
+            param_key_init_method=nn.init.xavier_normal_,
+            param_value_init_method=nn.init.zeros_
+        )
+
+        self.c_fc    = Pattention(
+            config=config,
+            input_channels=config.n_embd,
+            output_channels=2 * 4 * config.n_embd,
+             param_token_num=config.ffn_slot_num, # MODIFIED: use config variable
+            param_key_init_method=nn.init.xavier_normal_,
+            param_value_init_method=nn.init.zeros_
+        )
         self.silu    = nn.SiLU()
-        self.mlp_c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
+        self.mlp_c_proj  = Pattention(
+            config=config,
+            input_channels=4 * config.n_embd, # MODIFIED: Use 4*n_embd as input
+            output_channels=config.n_embd,
+             param_token_num=config.ffn_slot_num,  # MODIFIED: use config variable
+            param_key_init_method=nn.init.xavier_normal_,
+            param_value_init_method=nn.init.zeros_
+        )
 
         if (config.use_nGPT == 0):
             self.rmsnorm_att = RMSNorm(config.n_embd)
             self.rmsnorm_mlp = RMSNorm(config.n_embd)
-
+        
+        # MODIFIED: Initialize nGPT parameters if use_nGPT=1
         if (config.use_nGPT == 1):
             self.attn_alpha_init_value = 0.05
             self.attn_alpha_init_scaling = config.base_scale
@@ -91,17 +188,16 @@ class Block(nn.Module):
             self.mlp_alpha_init_scaling = config.base_scale
             self.mlp_alpha = torch.nn.Parameter(self.mlp_alpha_init_scaling*torch.ones(self.config.n_embd, dtype=torch.float32))
 
-            self.sqk_init_value = 1.0       
+            self.sqk_init_value = 1.0      
             self.sqk_init_scaling = config.base_scale
-            self.sqk = torch.nn.Parameter(self.sqk_init_scaling*torch.ones(self.config.n_embd, dtype=torch.float32))
+            self.sqk = torch.nn.Parameter(self.sqk_init_scaling*torch.ones(self.config.n_embd, dtype=torch.float32)) # MODIFIED: Keep it as n_embd
 
             self.suv_init_value = 1.0
             self.suv_init_scaling = 1.0
-            self.suv = torch.nn.Parameter(self.suv_init_scaling*torch.ones(2 * 4 * config.n_embd, dtype=torch.float32))
+            self.suv = torch.nn.Parameter(self.suv_init_scaling*torch.ones(2 * 4 * config.n_embd, dtype=torch.float32))# MODIFIED: Change it to 2 * 4 * n_embd
 
-    
     def justnorm(self, x):
-        #return F.normalize(x, p=2, dim=-1)
+        # MODIFIED: implementation of the hypersphere normalization
         res = x / x.norm(p=2, dim=-1, keepdim=True)
         return res
 
@@ -111,15 +207,11 @@ class Block(nn.Module):
         hin = h
         if (self.config.use_nGPT == 0):
             hin = self.rmsnorm_att(h)
+
+        q = self.query(hin).view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
+        k = self.key(hin).view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
+        v = self.value(hin).view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
         
-        q = self.query(hin)
-        k = self.key(hin)
-        v = self.value(hin)
-
-        q = q.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head) 
-        k = k.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
-        v = v.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
-
         sinusoidal_pos = get_sinusoidal_embeddings(T, self.config.n_embd // self.config.n_head).to(device=q.device)
         q, k = apply_rotary_position_embeddings(sinusoidal_pos, q.transpose(1, 2), k.transpose(1, 2))
         q = q.transpose(2, 1)
@@ -127,18 +219,17 @@ class Block(nn.Module):
 
         if (self.config.use_nGPT == 1):
             sqk = (self.sqk * (self.sqk_init_value/self.sqk_init_scaling)).view(1, 1, self.config.n_head, self.config.n_embd // self.config.n_head)
-            q = sqk * self.justnorm(q)  
-            k = sqk * self.justnorm(k)  
+            q = sqk * self.justnorm(q) 
+            k = sqk * self.justnorm(k)
 
         sqrt_head_dim = (self.config.n_embd / self.config.n_head) ** 0.5
         if (self.config.use_nGPT == 0): softmax_scale = 1.0 / sqrt_head_dim 
-        if (self.config.use_nGPT == 1): softmax_scale = sqrt_head_dim 
+        if (self.config.use_nGPT == 1): softmax_scale = sqrt_head_dim
         y = flash_attn_func(q.to(dtype=torch.bfloat16), k.to(dtype=torch.bfloat16), v.to(dtype=torch.bfloat16), dropout_p=0.0, softmax_scale=softmax_scale, causal=True, window_size=(-1, -1), alibi_slopes=None, deterministic=True)
         y = y.to(dtype=q.dtype)
         y = y.contiguous().view(B, T, self.config.n_embd)
-
+        
         h_att = self.att_c_proj(y)
-
         if (self.config.use_nGPT == 0):
             h = h + h_att
         if (self.config.use_nGPT == 1):
@@ -158,11 +249,11 @@ class Block(nn.Module):
         uv = self.c_fc(hin)
         if (self.config.use_nGPT == 1):
             suv = (self.suv * ((self.suv_init_value/self.suv_init_scaling) * (self.config.n_embd ** 0.5))) 
-            uv = suv * uv  
+            uv = suv * uv   
         u, v = torch.chunk(uv, 2, dim=-1)
         x_mlp = u * self.silu(v)
         h_mlp = self.mlp_c_proj(x_mlp)
-
+        
         if (self.config.use_nGPT == 0):
             h = h + h_mlp
         if (self.config.use_nGPT == 1):
@@ -175,7 +266,6 @@ class Block(nn.Module):
             #res = (1.0 - lr) * A_norm + lr * B_norm
             res = A_norm + lr * (B_norm - A_norm)
             h = self.justnorm(res)
-
         return h
 
 @dataclass
@@ -186,9 +276,13 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 1024
     base_scale: float = 1.0 / (1024.0 ** 0.5)    # 1 / sqrt(n_embd)
-    use_nGPT: int = 0
+    use_nGPT: int = 0 # MODIFIED: Add nGPT configuration
     dropout: float = 0.0
-    bias: bool = False 
+    bias: bool = False
+    qkv_slot_num: int = 2140 # MODIFIED: Added new parameters for Pattention
+    ffn_slot_num: int = 8560 # MODIFIED: Added new parameters for Pattention
+    proj_slot_num: int = 2140 # MODIFIED: Added new parameters for Pattention
+
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, embdim: int, eps: float = 1e-6) -> None:
@@ -218,7 +312,15 @@ class GPT(nn.Module):
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config, il) for il in range(config.n_layer)])
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # MODIFIED: Use Pattention for the lm_head
+        self.lm_head = Pattention(
+            config=config,
+            input_channels=config.n_embd,
+            output_channels=config.vocab_size,
+            param_token_num=config.vocab_size, # MODIFIED: use vocab size for parameter tokens
+            param_key_init_method=nn.init.xavier_normal_,
+            param_value_init_method=nn.init.zeros_
+        )
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
@@ -242,7 +344,6 @@ class GPT(nn.Module):
 
         if (config.use_nGPT == 0):
             self.rmsnorm_f = RMSNorm(config.n_embd)
-
 
     def get_num_params(self, non_embedding=True):
         """
@@ -278,18 +379,17 @@ class GPT(nn.Module):
         if (self.config.use_nGPT == 0):
             x = self.rmsnorm_f(x)
 
+        # MODIFIED: Use Pattention lm_head with scaled logits
+        logits = self.lm_head(x)
+        if (self.config.use_nGPT == 1):
+            sz = self.sz * (self.sz_init_value/self.sz_init_scaling)
+            logits = sz * logits
+
         if targets is not None:
-            logits = self.lm_head(x)
-            if (self.config.use_nGPT == 1):
-                sz = self.sz * (self.sz_init_value/self.sz_init_scaling)
-                logits = sz * logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            if (self.config.use_nGPT == 1):
-                sz = self.sz * (self.sz_init_value/self.sz_init_scaling)
-                logits = sz * logits
+            logits = logits[:, [-1], :] # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss
@@ -319,4 +419,3 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         print(f"using fused AdamW: {use_fused}")
         return optimizer
-
